@@ -290,7 +290,7 @@ fn run(
             slot.insert(0, hit);
         }
         None => {
-            let params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers());
+            let params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers() as u32);
             let model = LlamaModel::load_from_file(backend(), &path, &params)
                 .map_err(|e| format!("加载 GGUF 失败：{e}"))?;
             slot.insert(0, Loaded { path: path.clone(), model });
@@ -322,7 +322,7 @@ fn generate(
     // 而短翻译只占一个不满的块，所以一切正常。这正是“纠错/对话闪退、翻译却没事”的根因。
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
-        .with_n_batch(NonZeroU32::new(1024).unwrap())
+        .with_n_batch(1024)
         .with_n_threads(threads)
         .with_n_threads_batch(threads);
     let mut ctx = model
