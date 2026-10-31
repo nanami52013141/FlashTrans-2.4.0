@@ -40,7 +40,7 @@ jobs:
       # llama-cpp-2（GGUF 推理）编译期需要 libclang
       - name: Install LLVM (libclang)
         id: llvm
-        uses: ZhongRuoyu/setup-llvm@v1
+        uses: ZhongRuoyu/setup-llvm@v0.2.0
         with:
           llvm-version: "18"
 
