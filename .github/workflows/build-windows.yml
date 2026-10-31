@@ -40,12 +40,12 @@ jobs:
       # llama-cpp-2（GGUF 推理）编译期需要 libclang
       - name: Install LLVM (libclang)
         id: llvm
-        uses: KyleMayes/setup-llvm@v2
+        uses: ZhongRuoyu/setup-llvm@v1
         with:
-          version: "18"
+          llvm-version: "18"
 
       - name: Export LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=${{ steps.llvm.outputs.libclang-path }}" >> $env:GITHUB_ENV
+        run: echo "LIBCLANG_PATH=${{ steps.llvm.outputs.llvm-path }}/bin" >> $env:GITHUB_ENV
 
       - name: Setup Rust (MSVC)
         uses: dtolnay/rust-toolchain@stable
