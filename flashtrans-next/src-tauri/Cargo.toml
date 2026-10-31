@@ -1,0 +1,59 @@
+[package]
+name = "flashtrans-next"
+version = "2.4.0"
+description = "FlashTrans — 极速划词翻译"
+authors = ["chai1220"]
+edition = "2021"
+
+[lib]
+name = "flashtrans_next_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+enigo = "0.6"
+arboard = "3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
+image = "0.25"
+base64 = "0.22"
+llama-cpp-2 = "0.1.151"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+] }
+
+[profile.dev]
+opt-level = 1
+
+[features]
+default = []
+# 启用 GGUF 大模型的 CUDA 加速：需在本机安装 CUDA Toolkit，
+# 然后用 `cargo tauri build --features cuda`（或 `cargo build --features cuda`）构建。
+# 不启用时（默认）GGUF 走 CPU，n_gpu_layers 设置会被 llama.cpp 忽略，构建无需 CUDA。
+cuda = ["llama-cpp-2/cuda"]

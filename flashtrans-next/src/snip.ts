@@ -1,0 +1,220 @@
+// FlashTrans F3 区域截图框选（覆盖整个虚拟桌面，裁剪按图片自然/显示尺寸比例，DPI 无关）
+import { invoke } from "@tauri-apps/api/core";
+import { listen, emitTo } from "@tauri-apps/api/event";
+import { loadSettings, activeOcrProfile, type Settings } from "./shared";
+
+/** OCR 返回的一个自然段：文本 + 在截图里的位置（物理像素） */
+interface OcrBlock {
+  text: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const $ = (id: string) => document.getElementById(id) as HTMLElement;
+
+let dragging = false;
+let sx = 0;
+let sy = 0;
+let rect = { x: 0, y: 0, w: 0, h: 0 };
+let ready = false;
+
+async function pullShot() {
+  const data = (await invoke("snip_data")) as string | null;
+  const img = $("shot") as HTMLImageElement;
+  ready = false;
+  resetUi();
+  if (!data) return; // 还没截过图（应用刚启动时的那次主动拉取），窗口保持隐藏
+
+  img.src = data;
+  // 解码完成再让窗口现身，1.2s 兜底免得解码卡住让 F3 像没反应
+  await Promise.race([
+    img.decode().catch(() => {}),
+    new Promise((r) => setTimeout(r, 1200)),
+  ]);
+  // naturalWidth 还是 0 就不许框选，否则裁剪比例会算错
+  ready = img.naturalWidth > 0;
+  await invoke("snip_show");
+}
+
+function resetUi() {
+  dragging = false;
+  $("sel").style.display = "none";
+  $("dim-idle").style.display = "";
+  $("hint").style.display = "";
+}
+
+/**
+ * 收起窗口前把底图清掉。
+ * 窗口隐藏期间 WebView 不做合成，图层里一直存着上一次那张全屏截图；
+ * 下次显示时会先亮出这一帧旧图再换成新的 —— 用户看到的就是"屏幕先闪回上一个页面"。
+ * （所以在同一个页面连续截图不闪：那张旧图和当前屏幕本来就一样。）
+ * 清空之后即使抢先亮一帧也只是透明，底下就是真实桌面，察觉不到。
+ */
+function clearShot() {
+  ready = false;
+  ($("shot") as HTMLImageElement).removeAttribute("src");
+}
+
+async function cancel() {
+  clearShot();
+  resetUi();
+  await invoke("snip_hide");
+}
+
+// 显示尺寸 → 截图自然（物理）像素的换算比例；对任何 DPI/缩放都成立
+function ratios() {
+  const shot = $("shot") as HTMLImageElement;
+  const rx = shot.clientWidth ? shot.naturalWidth / shot.clientWidth : 1;
+  const ry = shot.clientHeight ? shot.naturalHeight / shot.clientHeight : 1;
+  return { rx, ry };
+}
+
+function updateSel(x: number, y: number, w: number, h: number) {
+  const sel = $("sel");
+  sel.style.display = "block"; // 注意：CSS 里 #sel 默认 display:none，用 "" 会退回隐藏
+  sel.style.left = `${x}px`;
+  sel.style.top = `${y}px`;
+  sel.style.width = `${w}px`;
+  sel.style.height = `${h}px`;
+  const { rx, ry } = ratios();
+  $("size-tag").textContent = `${Math.round(w * rx)} × ${Math.round(h * ry)}`;
+}
+
+/** 裁剪出框选区域。physX/Y/W/H 是相对整张全屏截图的物理像素，原位覆盖窗口靠它定位 */
+function cropDataUrl(): {
+  url: string; wCss: number; hCss: number;
+  physX: number; physY: number; physW: number; physH: number;
+} {
+  const shot = $("shot") as HTMLImageElement;
+  const { rx, ry } = ratios();
+  const cx = Math.round(rect.x * rx);
+  const cy = Math.round(rect.y * ry);
+  const cw = Math.max(1, Math.round(rect.w * rx));
+  const ch = Math.max(1, Math.round(rect.h * ry));
+  const canvas = document.createElement("canvas");
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(shot, cx, cy, cw, ch, 0, 0, cw, ch);
+  return {
+    url: canvas.toDataURL("image/png"), wCss: rect.w, hCss: rect.h,
+    physX: cx, physY: cy, physW: cw, physH: ch,
+  };
+}
+
+async function confirmCrop() {
+  const crop = cropDataUrl(); // 必须先裁完再清底图
+  const { url, wCss, hCss } = crop;
+  clearShot();
+  resetUi();
+  await invoke("snip_hide");
+
+  // 弹窗先展示识别中状态
+  await invoke("popup_present", { width: 420, height: 118, focus: false });
+  await emitTo("popup", "popup-mode", { mode: "status", text: "正在识别文字…" });
+
+  let settings: Settings;
+  try {
+    settings = await loadSettings();
+  } catch {
+    await emitTo("popup", "popup-mode", { mode: "ocr", error: "读取设置失败", cropB64: url, cropW: wCss, cropH: hCss });
+    return;
+  }
+
+  try {
+    const prof = activeOcrProfile(settings);
+    const res = (await invoke("native_ocr", {
+      req: {
+        imageB64: url,
+        sourceLang: settings.sourceLang,
+        custom: prof
+          ? {
+              recPath: prof.recPath, keysPath: prof.keysPath,
+              detPath: prof.detPath, clsPath: prof.clsPath,
+              recHeight: prof.recHeight ?? 0, // 0 = 让后端读 ONNX 自己判断
+            }
+          : {},
+      },
+    })) as { source?: string; blocks?: OcrBlock[] };
+    const source = (res.source ?? "").trim();
+    // 无论是否识别到文字，都把截图带过去，让弹窗能复制图 / 贴图
+    if (!source) {
+      await emitTo("popup", "popup-mode", {
+        mode: "ocr", error: "未识别到文字（可复制或贴图这张截图）",
+        cropB64: url, cropW: wCss, cropH: hCss,
+      });
+      return;
+    }
+
+    // ── 原位覆盖：把译文盖回文字原来的位置，翻译改由覆盖窗口逐段完成，
+    //    完成后它会把整段原文/译文回传给弹窗（所以这里不再重复翻一遍）──
+    const blocks = (res.blocks ?? []).filter((b) => b.w > 0 && b.h > 0);
+    if (settings.snipOverlay && blocks.length) {
+      await emitTo("popup", "popup-mode", { mode: "status", text: "正在翻译…" });
+      await invoke("overlay_show", {
+        req: {
+          img: url, blocks,
+          x: crop.physX, y: crop.physY, w: crop.physW, h: crop.physH,
+          cssW: wCss, cssH: hCss,
+        },
+      });
+      return;
+    }
+
+    await emitTo("popup", "popup-mode", {
+      mode: "f1", state: "text", text: source, title: "截图翻译", ocr: true,
+      cropB64: url, cropW: wCss, cropH: hCss,
+    });
+  } catch (e) {
+    await emitTo("popup", "popup-mode", {
+      mode: "ocr", error: String(e), cropB64: url, cropW: wCss, cropH: hCss,
+    });
+  }
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  // 主动拉取一次（覆盖首次窗口就绪早于事件的情况）
+  pullShot();
+  // 后续 F3 通过事件再次拉取
+  listen("snip-open", () => pullShot());
+
+  document.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || !ready) return;
+    dragging = true;
+    sx = e.clientX;
+    sy = e.clientY;
+    $("dim-idle").style.display = "none";
+    $("hint").style.display = "none";
+    updateSel(sx, sy, 0, 0);
+  });
+
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const x = Math.min(sx, e.clientX);
+    const y = Math.min(sy, e.clientY);
+    const w = Math.abs(e.clientX - sx);
+    const h = Math.abs(e.clientY - sy);
+    rect = { x, y, w, h };
+    updateSel(x, y, w, h);
+  });
+
+  document.addEventListener("mouseup", async (e) => {
+    if (!dragging || e.button !== 0) return;
+    dragging = false;
+    if (rect.w < 6 || rect.h < 6) {
+      resetUi();
+      return;
+    }
+    await confirmCrop();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") cancel();
+  });
+  document.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    cancel();
+  });
+});
