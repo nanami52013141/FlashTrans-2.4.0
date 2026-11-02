@@ -863,6 +863,7 @@ struct BridgeSession {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
 }
 
 impl Drop for BridgeSession {
@@ -1471,7 +1472,7 @@ fn start_bridge(backend: &str, model: &str) -> Result<BridgeSession, String> {
         .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         cmd.creation_flags(0x08000000);
@@ -1479,11 +1480,13 @@ fn start_bridge(backend: &str, model: &str) -> Result<BridgeSession, String> {
     let mut child = cmd.spawn().map_err(|e| format!("启动本地模型桥接失败：{e}"))?;
     let stdin = child.stdin.take().ok_or("无法打开 bridge stdin")?;
     let stdout = child.stdout.take().ok_or("无法打开 bridge stdout")?;
+    let stderr = child.stderr.take();
     Ok(BridgeSession {
         key: format!("{backend}|{model}"),
         child,
         stdin,
         stdout: BufReader::new(stdout),
+        stderr,
     })
 }
 
@@ -1495,7 +1498,28 @@ fn session_io(session: &mut BridgeSession, payload: &Value) -> Result<Value, Str
     let mut out = String::new();
     session.stdout.read_line(&mut out).map_err(|e| e.to_string())?;
     if out.trim().is_empty() {
-        return Err("本地模型 bridge 没有返回结果".into());
+        // 进程多半已崩溃退出（stdout 关闭）。把 bridge 的 stderr 崩溃日志捞出一起报，
+        // 否则用户只能看到一句「没有返回结果」，无从排查（如 ctranslate2 加载模型段错误）。
+        let mut msg = String::from("本地模型 bridge 没有返回结果");
+        if let Some(mut e) = session.stderr.take() {
+            use std::io::Read;
+            let mut buf = String::new();
+            if e.read_to_string(&mut buf).is_ok() {
+                let tail: String = buf
+                    .lines()
+                    .rev()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !tail.trim().is_empty() {
+                    msg.push_str(&format!("（bridge 崩溃日志：\n{}）", tail));
+                }
+            }
+        }
+        return Err(msg.into());
     }
     let v: Value = serde_json::from_str(out.trim()).map_err(|e| e.to_string())?;
     if v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
